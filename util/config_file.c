@@ -259,6 +259,10 @@ config_create(void)
 	cfg->qname_minimisation_strict = 0;
 	cfg->shm_enable = 0;
 	cfg->shm_key = 11777;
+	cfg->dnscrypt_port = 0;
+	cfg->dnscrypt_provider = NULL;
+	cfg->dnscrypt_provider_cert = NULL;
+	cfg->dnscrypt_secret_key = NULL;
 	return cfg;
 error_exit:
 	config_delete(cfg); 

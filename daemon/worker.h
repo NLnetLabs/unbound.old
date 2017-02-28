@@ -52,6 +52,7 @@
 #include "daemon/stats.h"
 #include "util/module.h"
 #include "dnstap/dnstap.h"
+#include "dnscrypt/dnscrypt.h"
 struct listen_dnsport;
 struct outside_network;
 struct config_file;

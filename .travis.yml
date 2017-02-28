@@ -1,0 +1,34 @@
+language: c
+
+compiler:
+ - clang
+ - gcc
+
+env:
+  - WITH_DNSC=--enable-dnscrypt
+  - WITH_DNSC=
+
+before_install:
+ - $CC --version
+ - which $CC
+ # workaround clang not system wide, fail on sudo make install
+ - export CC=`which $CC`
+
+before_script:
+ - sudo apt-get install libevent-dev
+ - cd /tmp
+ - git clone git://github.com/jedisct1/libsodium.git
+ - cd libsodium
+ - git checkout 1.0.7
+ - ./autogen.sh
+ - ./configure --disable-dependency-tracking --enable-minimal
+ - sudo make install
+ - sudo ldconfig
+ - cd ${TRAVIS_BUILD_DIR}
+
+script:
+ - autoreconf -vi --force
+ - ./configure --with-libevent=yes ${WITH_DNSC}
+ - bison -d -o util/configparser.c util/configparser.y
+ - make
+ - make test

@@ -480,7 +480,15 @@ sldns_buffer_write_at(sldns_buffer *buffer, size_t at, const void *data, size_t 
 INLINE void
 sldns_buffer_set_at(sldns_buffer *buffer, size_t at, int c, size_t count)
 {
-	assert(sldns_buffer_available_at(buffer, at, count));
+    if (!buffer->_vfixed)
+        assert(sldns_buffer_available_at(buffer, at, count));
+    else if (sldns_buffer_remaining_at(buffer, at) == 0)
+        return;
+    else if (count > sldns_buffer_remaining_at(buffer, at)) {
+        memset(buffer->_data + at, c,
+            sldns_buffer_remaining_at(buffer, at));
+        return;
+    }
 	memset(buffer->_data + at, c, count);
 }
 

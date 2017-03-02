@@ -14,6 +14,231 @@
 
 #include <ctype.h>
 
+#define DNSCRYPT_QUERY_BOX_OFFSET \
+    (DNSCRYPT_MAGIC_HEADER_LEN + crypto_box_PUBLICKEYBYTES + crypto_box_HALF_NONCEBYTES)
+
+//  8 bytes: magic header (CERT_MAGIC_HEADER)
+// 12 bytes: the client's nonce
+// 12 bytes: server nonce extension
+// 16 bytes: Poly1305 MAC (crypto_box_ZEROBYTES - crypto_box_BOXZEROBYTES)
+
+#define DNSCRYPT_REPLY_BOX_OFFSET \
+    (DNSCRYPT_MAGIC_HEADER_LEN + crypto_box_HALF_NONCEBYTES + crypto_box_HALF_NONCEBYTES)
+
+/**
+ * Decrypt a query using the keypair that was found using dnsc_find_keypair.
+ * The client nonce will be extracted from the encrypted query and stored in
+ * client_nonce, a shared secret will be computed and stored in nmkey and the
+ * buffer will be decrypted inplace.
+ * \param[in] keypair the keypair that matches this encrypted query.
+ * \param[in] client_nonce where the client nonce will be stored.
+ * \param[in] nmkey where the shared secret key will be written.
+ * \param[in] buffer the encrypted buffer.
+ * \return 0 on success.
+ */
+static int
+dnscrypt_server_uncurve(const KeyPair *keypair,
+                        uint8_t client_nonce[crypto_box_HALF_NONCEBYTES],
+                        uint8_t nmkey[crypto_box_BEFORENMBYTES],
+                        struct sldns_buffer* buffer)
+{
+    size_t len = sldns_buffer_limit(buffer);
+    uint8_t *const buf = sldns_buffer_begin(buffer);
+    uint8_t nonce[crypto_box_NONCEBYTES];
+    struct dnscrypt_query_header *query_header;
+
+    if (len <= DNSCRYPT_QUERY_HEADER_SIZE) {
+        return -1;
+    }
+
+    query_header = (struct dnscrypt_query_header *)buf;
+    memcpy(nmkey, query_header->publickey, crypto_box_PUBLICKEYBYTES);
+    if (crypto_box_beforenm(nmkey, nmkey, keypair->crypt_secretkey) != 0) {
+        return -1;
+    }
+
+    memcpy(nonce, query_header->nonce, crypto_box_HALF_NONCEBYTES);
+    memset(nonce + crypto_box_HALF_NONCEBYTES, 0, crypto_box_HALF_NONCEBYTES);
+
+    sldns_buffer_set_at(buffer,
+                        DNSCRYPT_QUERY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
+                        0, crypto_box_BOXZEROBYTES);
+
+    if (crypto_box_open_afternm
+        (buf + DNSCRYPT_QUERY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
+         buf + DNSCRYPT_QUERY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
+         len - DNSCRYPT_QUERY_BOX_OFFSET + crypto_box_BOXZEROBYTES, nonce,
+         nmkey) != 0) {
+        return -1;
+    }
+
+    while (*sldns_buffer_at(buffer, --len) == 0);
+
+    if (*sldns_buffer_at(buffer, len) != 0x80) {
+        return -1;
+    }
+
+    memcpy(client_nonce, nonce, crypto_box_HALF_NONCEBYTES);
+    memmove(sldns_buffer_begin(buffer),
+            sldns_buffer_at(buffer, DNSCRYPT_QUERY_HEADER_SIZE),
+            len - DNSCRYPT_QUERY_HEADER_SIZE);
+
+    sldns_buffer_set_position(buffer, 0);
+    sldns_buffer_set_limit(buffer, len - DNSCRYPT_QUERY_HEADER_SIZE);
+
+    return 0;
+}
+
+
+/**
+ * Add random padding to a buffer, according to a client nonce.
+ * The length has to depend on the query in order to avoid reply attacks.
+ *
+ * @param buf a buffer
+ * @param len the initial size of the buffer
+ * @param max_len the maximum size
+ * @param nonce a nonce, made of the client nonce repeated twice
+ * @param secretkey
+ * @return the new size, after padding
+ */
+size_t
+dnscrypt_pad(uint8_t *buf, const size_t len, const size_t max_len,
+             const uint8_t *nonce, const uint8_t *secretkey)
+{
+    uint8_t *buf_padding_area = buf + len;
+    size_t padded_len;
+    uint32_t rnd;
+
+    // no padding
+    if (max_len < len + DNSCRYPT_MIN_PAD_LEN)
+        return len;
+
+    assert(nonce[crypto_box_HALF_NONCEBYTES] == nonce[0]);
+
+    crypto_stream((unsigned char *)&rnd, (unsigned long long)sizeof(rnd), nonce,
+                  secretkey);
+    padded_len =
+        len + DNSCRYPT_MIN_PAD_LEN + rnd % (max_len - len -
+                                            DNSCRYPT_MIN_PAD_LEN + 1);
+    padded_len += DNSCRYPT_BLOCK_SIZE - padded_len % DNSCRYPT_BLOCK_SIZE;
+    if (padded_len > max_len)
+        padded_len = max_len;
+
+    memset(buf_padding_area, 0, padded_len - len);
+    *buf_padding_area = 0x80;
+
+    return padded_len;
+}
+
+uint64_t
+dnscrypt_hrtime(void)
+{
+    struct timeval tv;
+    uint64_t ts = (uint64_t)0U;
+    int ret;
+
+    ret = evutil_gettimeofday(&tv, NULL);
+    assert(ret == 0);
+    if (ret == 0) {
+        ts = (uint64_t)tv.tv_sec * 1000000U + (uint64_t)tv.tv_usec;
+    }
+    return ts;
+}
+
+/**
+ * Add the server nonce part to once.
+ * The nonce is made half of client nonce and the seconf half of the server
+ * nonce, both of them of size crypto_box_HALF_NONCEBYTES.
+ * \param[in] nonce: a uint8_t* of size crypto_box_NONCEBYTES
+ */
+static void
+add_server_nonce(uint8_t *nonce)
+{
+    uint64_t ts;
+    uint64_t tsn;
+    uint32_t suffix;
+    ts = dnscrypt_hrtime();
+    // TODO? dnscrypt-wrapper does some logic with context->nonce_ts_last
+    // unclear if we really need it, so skipping it for now.
+    tsn = (ts << 10) | (randombytes_random() & 0x3ff);
+#if (BYTE_ORDER == LITTLE_ENDIAN)
+    tsn =
+        (((uint64_t)htonl((uint32_t)tsn)) << 32) | htonl((uint32_t)(tsn >> 32));
+#endif
+    memcpy(nonce + crypto_box_HALF_NONCEBYTES, &tsn, 8);
+    suffix = randombytes_random();
+    memcpy(nonce + crypto_box_HALF_NONCEBYTES + 8, &suffix, 4);
+}
+
+/**
+ * Encrypt a reply using the keypair that was used with the query.
+ * The client nonce will be extracted from the encrypted query and stored in
+ * The buffer will be encrypted inplace.
+ * \param[in] keypair the keypair that matches this encrypted query.
+ * \param[in] client_nonce client nonce used during the query
+ * \param[in] nmkey shared secret key used during the query.
+ * \param[in] buffer the buffer where to encrypt the reply.
+ * \param[in] udp if whether or not it is a UDP query.
+ * \param[in] max_udp_size configured max udp size.
+ * \return 0 on success.
+ */
+static int
+dnscrypt_server_curve(const KeyPair *keypair,
+                      uint8_t client_nonce[crypto_box_HALF_NONCEBYTES],
+                      uint8_t nmkey[crypto_box_BEFORENMBYTES],
+                      struct sldns_buffer* buffer,
+                      uint8_t udp,
+                      size_t max_udp_size)
+{
+    size_t dns_reply_len = sldns_buffer_limit(buffer);
+    size_t max_len = dns_reply_len + DNSCRYPT_MAX_PADDING + DNSCRYPT_REPLY_HEADER_SIZE;
+    size_t max_reply_size = max_udp_size - 20U - 8U;
+    uint8_t nonce[crypto_box_NONCEBYTES];
+    uint8_t *boxed;
+    uint8_t *const buf = sldns_buffer_begin(buffer);
+    size_t len = sldns_buffer_limit(buffer);
+
+    if(udp){
+        if (max_len > max_reply_size)
+            max_len = max_reply_size;
+    }
+
+
+    memcpy(nonce, client_nonce, crypto_box_HALF_NONCEBYTES);
+    memcpy(nonce + crypto_box_HALF_NONCEBYTES, client_nonce,
+           crypto_box_HALF_NONCEBYTES);
+
+    boxed = buf + DNSCRYPT_REPLY_BOX_OFFSET;
+    memmove(boxed + crypto_box_MACBYTES, buf, len);
+    len = dnscrypt_pad(boxed + crypto_box_MACBYTES, len,
+                       max_len - DNSCRYPT_REPLY_HEADER_SIZE, nonce,
+                       keypair->crypt_secretkey);
+    sldns_buffer_set_at(buffer,
+                        DNSCRYPT_REPLY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
+                        0, crypto_box_ZEROBYTES);
+
+    // add server nonce extension
+    add_server_nonce(nonce);
+
+    if (crypto_box_afternm
+        (boxed - crypto_box_BOXZEROBYTES, boxed - crypto_box_BOXZEROBYTES,
+         len + crypto_box_ZEROBYTES, nonce, nmkey) != 0) {
+        return -1;
+    }
+
+    sldns_buffer_write_at(buffer, 0, DNSCRYPT_MAGIC_RESPONSE, DNSCRYPT_MAGIC_HEADER_LEN);
+    sldns_buffer_write_at(buffer, DNSCRYPT_MAGIC_HEADER_LEN, nonce, crypto_box_NONCEBYTES);
+    sldns_buffer_set_limit(buffer, len + DNSCRYPT_REPLY_HEADER_SIZE);
+    return 0;
+}
+
+/**
+ * Read the content of fname into buf.
+ * \param[in] fname name of the file to read.
+ * \param[in] buf the buffer in which to read the content of the file.
+ * \param[in] count number of bytes to read.
+ * \return 0 on success.
+ */
 static int
 dnsc_read_from_file(char *fname, char *buf, size_t count)
 {
@@ -30,6 +255,13 @@ dnsc_read_from_file(char *fname, char *buf, size_t count)
 	return 0;
 }
 
+/**
+ * Parse certificates files provided by the configuration and load them into
+ * dnsc_env.
+ * \param[in] env the dnsc_env structure to load the certs into.
+ * \param[in] cfg the configuration.
+ * \return the number of certificates loaded.
+ */
 static int
 dnsc_parse_certs(struct dnsc_env *env, struct config_file *cfg)
 {
@@ -56,6 +288,11 @@ dnsc_parse_certs(struct dnsc_env *env, struct config_file *cfg)
 	return signed_cert_id;
 }
 
+/**
+ * Helper function to convert a binary key into a printable fingerprint.
+ * \param[in] fingerprint the buffer in which to write the printable key.
+ * \param[in] key the key to convert.
+ */
 void
 dnsc_key_to_fingerprint(char fingerprint[80U], const uint8_t * const key)
 {
@@ -77,7 +314,14 @@ dnsc_key_to_fingerprint(char fingerprint[80U], const uint8_t * const key)
     }
 }
 
-const KeyPair *
+/**
+ * Find the keypair matching a DNSCrypt query.
+ * \param[in] dnscenv The DNSCrypt enviroment, which contains the list of keys
+ * supported by the server.
+ * \param[in] buffer The encrypted DNS query.
+ * \return a KeyPair * if we found a key pair matching the query, NULL otherwise.
+ */
+static const KeyPair *
 dnsc_find_keypair(struct dnsc_env* dnscenv, struct sldns_buffer* buffer)
 {
 	const KeyPair *keypairs = dnscenv->keypairs;
@@ -91,7 +335,6 @@ dnsc_find_keypair(struct dnsc_env* dnscenv, struct sldns_buffer* buffer)
 	for (i = 0U; i < dnscenv->keypairs_count; i++) {
 		if (memcmp(keypairs[i].crypt_publickey, dnscrypt_header->magic_query,
                    DNSCRYPT_MAGIC_HEADER_LEN) == 0) {
-			//verbose(VERB_OPS, "dnsc_find_keypair: Found keypair at index %zu", i);
 			return &keypairs[i];
 		}
 	}
@@ -151,7 +394,12 @@ dnsc_load_local_data(struct dnsc_env* dnscenv, struct config_file *cfg)
     return dnscenv->signed_certs_count;
 }
 
-
+/**
+ * Parse the secret key files from `dnscrypt-secret-key` config and populates
+ * a list of secret/public keys supported by dnscrypt listener.
+ * \param[in] env The dnsc_env structure which will hold the keypairs.
+ * \param[in] cfg The config with the secret key file paths.
+ */
 static int
 dnsc_parse_keys(struct dnsc_env *env, struct config_file *cfg)
 {
@@ -184,6 +432,13 @@ dnsc_parse_keys(struct dnsc_env *env, struct config_file *cfg)
 	}
 	return keypair_id;
 }
+
+
+/**
+ * #########################################################
+ * ############# Publicly accessible functions #############
+ * #########################################################
+ */
 
 int
 dnsc_handle_curved_request(struct dnsc_env* dnscenv,
@@ -264,191 +519,4 @@ dnsc_apply_cfg(struct dnsc_env *env, struct config_file *cfg)
 		fatal_exit("dnsc_apply_cfg: could not load local data");
 	}
 	return 0;
-}
-
-#define DNSCRYPT_QUERY_BOX_OFFSET \
-    (DNSCRYPT_MAGIC_HEADER_LEN + crypto_box_PUBLICKEYBYTES + crypto_box_HALF_NONCEBYTES)
-
-int
-dnscrypt_server_uncurve(const KeyPair *keypair,
-                        uint8_t client_nonce[crypto_box_HALF_NONCEBYTES],
-                        uint8_t nmkey[crypto_box_BEFORENMBYTES],
-												struct sldns_buffer* buffer)
-{
-    size_t len = sldns_buffer_limit(buffer);
-		uint8_t *const buf = sldns_buffer_begin(buffer);
-    uint8_t nonce[crypto_box_NONCEBYTES];
-    struct dnscrypt_query_header *query_header;
-
-    if (len <= DNSCRYPT_QUERY_HEADER_SIZE) {
-        return -1;
-    }
-
-    query_header =
-        (struct dnscrypt_query_header *)buf;
-    memcpy(nmkey, query_header->publickey, crypto_box_PUBLICKEYBYTES);
-    if (crypto_box_beforenm(nmkey, nmkey, keypair->crypt_secretkey) != 0) {
-        return -1;
-    }
-
-    memcpy(nonce, query_header->nonce, crypto_box_HALF_NONCEBYTES);
-    memset(nonce + crypto_box_HALF_NONCEBYTES, 0, crypto_box_HALF_NONCEBYTES);
-
-		sldns_buffer_set_at(buffer, DNSCRYPT_QUERY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
-						0, crypto_box_BOXZEROBYTES);
-
-    if (crypto_box_open_afternm
-        (buf + DNSCRYPT_QUERY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
-         buf + DNSCRYPT_QUERY_BOX_OFFSET - crypto_box_BOXZEROBYTES,
-         len - DNSCRYPT_QUERY_BOX_OFFSET + crypto_box_BOXZEROBYTES, nonce,
-         nmkey) != 0) {
-        return -1;
-    }
-
-    while (*sldns_buffer_at(buffer, --len) == 0);
-
-    if (*sldns_buffer_at(buffer, len) != 0x80) {
-        return -1;
-    }
-
-    memcpy(client_nonce, nonce, crypto_box_HALF_NONCEBYTES);
-		memmove(buffer->_data, buffer->_data + DNSCRYPT_QUERY_HEADER_SIZE, len - DNSCRYPT_QUERY_HEADER_SIZE);
-
-		sldns_buffer_set_position(buffer, 0);
-		sldns_buffer_set_limit(buffer, len - DNSCRYPT_QUERY_HEADER_SIZE);
-
-    return 0;
-}
-
-
-/**
- * Add random padding to a buffer, according to a client nonce.
- * The length has to depend on the query in order to avoid reply attacks.
- *
- * @param buf a buffer
- * @param len the initial size of the buffer
- * @param max_len the maximum size
- * @param nonce a nonce, made of the client nonce repeated twice
- * @param secretkey
- * @return the new size, after padding
- */
-size_t
-dnscrypt_pad(uint8_t *buf, const size_t len, const size_t max_len,
-             const uint8_t *nonce, const uint8_t *secretkey)
-{
-    uint8_t *buf_padding_area = buf + len;
-    size_t padded_len;
-    uint32_t rnd;
-
-    // no padding
-    if (max_len < len + DNSCRYPT_MIN_PAD_LEN)
-        return len;
-
-    assert(nonce[crypto_box_HALF_NONCEBYTES] == nonce[0]);
-
-    crypto_stream((unsigned char *)&rnd, (unsigned long long)sizeof(rnd), nonce,
-                  secretkey);
-    padded_len =
-        len + DNSCRYPT_MIN_PAD_LEN + rnd % (max_len - len -
-                                            DNSCRYPT_MIN_PAD_LEN + 1);
-    padded_len += DNSCRYPT_BLOCK_SIZE - padded_len % DNSCRYPT_BLOCK_SIZE;
-    if (padded_len > max_len)
-        padded_len = max_len;
-
-    memset(buf_padding_area, 0, padded_len - len);
-    *buf_padding_area = 0x80;
-
-    return padded_len;
-}
-
-uint64_t
-dnscrypt_hrtime(void)
-{
-    struct timeval tv;
-    uint64_t ts = (uint64_t)0U;
-    int ret;
-
-    ret = evutil_gettimeofday(&tv, NULL);
-    assert(ret == 0);
-    if (ret == 0) {
-        ts = (uint64_t)tv.tv_sec * 1000000U + (uint64_t)tv.tv_usec;
-    }
-    return ts;
-}
-
-void
-add_server_nonce(uint8_t *nonce)
-{
-    uint64_t ts;
-    uint64_t tsn;
-    uint32_t suffix;
-    ts = dnscrypt_hrtime();
-		// TODO? dnscrypt-wrapper does some logic with context->nonce_ts_last
-		// unclear if we need it really, so skipping it for now.
-    tsn = (ts << 10) | (randombytes_random() & 0x3ff);
-#if (BYTE_ORDER == LITTLE_ENDIAN)
-    tsn =
-        (((uint64_t)htonl((uint32_t)tsn)) << 32) | htonl((uint32_t)(tsn >> 32));
-#endif
-    memcpy(nonce + crypto_box_HALF_NONCEBYTES, &tsn, 8);
-    suffix = randombytes_random();
-    memcpy(nonce + crypto_box_HALF_NONCEBYTES + 8, &suffix, 4);
-}
-
-//  8 bytes: magic header (CERT_MAGIC_HEADER)
-// 12 bytes: the client's nonce
-// 12 bytes: server nonce extension
-// 16 bytes: Poly1305 MAC (crypto_box_ZEROBYTES - crypto_box_BOXZEROBYTES)
-
-#define DNSCRYPT_REPLY_BOX_OFFSET \
-    (DNSCRYPT_MAGIC_HEADER_LEN + crypto_box_HALF_NONCEBYTES + crypto_box_HALF_NONCEBYTES)
-
-
-int
-dnscrypt_server_curve(const KeyPair *keypair,
-                      uint8_t client_nonce[crypto_box_HALF_NONCEBYTES],
-                      uint8_t nmkey[crypto_box_BEFORENMBYTES],
-                      struct sldns_buffer* buffer,
-                      uint8_t udp,
-                      size_t max_udp_size)
-{
-    size_t dns_reply_len = sldns_buffer_limit(buffer);
-    size_t max_len = dns_reply_len + DNSCRYPT_MAX_PADDING + DNSCRYPT_REPLY_HEADER_SIZE;
-    size_t max_reply_size = max_udp_size - 20U - 8U;
-    uint8_t nonce[crypto_box_NONCEBYTES];
-    uint8_t *boxed;
-    uint8_t *const buf = sldns_buffer_begin(buffer);
-    size_t len = sldns_buffer_limit(buffer);
-
-    if(udp){
-        if (max_len > max_reply_size)
-            max_len = max_reply_size;
-    }
-
-
-    memcpy(nonce, client_nonce, crypto_box_HALF_NONCEBYTES);
-    memcpy(nonce + crypto_box_HALF_NONCEBYTES, client_nonce,
-           crypto_box_HALF_NONCEBYTES);
-
-    boxed = buf + DNSCRYPT_REPLY_BOX_OFFSET;
-    memmove(boxed + crypto_box_MACBYTES, buf, len);
-    len =
-        dnscrypt_pad(boxed + crypto_box_MACBYTES, len,
-                     max_len - DNSCRYPT_REPLY_HEADER_SIZE, nonce,
-                     keypair->crypt_secretkey);
-    memset(boxed - crypto_box_BOXZEROBYTES, 0, crypto_box_ZEROBYTES);
-
-    // add server nonce extension
-    add_server_nonce(nonce);
-
-    if (crypto_box_afternm
-        (boxed - crypto_box_BOXZEROBYTES, boxed - crypto_box_BOXZEROBYTES,
-         len + crypto_box_ZEROBYTES, nonce, nmkey) != 0) {
-        return -1;
-    }
-
-    memcpy(buf, DNSCRYPT_MAGIC_RESPONSE, DNSCRYPT_MAGIC_HEADER_LEN);
-    memcpy(buf + DNSCRYPT_MAGIC_HEADER_LEN, nonce, crypto_box_NONCEBYTES);
-    sldns_buffer_set_limit(buffer, len + DNSCRYPT_REPLY_HEADER_SIZE);
-    return 0;
 }

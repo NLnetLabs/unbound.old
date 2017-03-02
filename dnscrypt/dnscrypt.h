@@ -55,14 +55,23 @@ struct dnscrypt_query_header {
     uint8_t mac[crypto_box_MACBYTES];
 };
 
-struct dnsc_env *
-dnsc_create(void);
+/**
+ * Initialize DNSCrypt enviroment.
+ * Initialize sodium library and allocate the dnsc_env structure.
+ * \return an unitialized struct dnsc_env.
+ */
+struct dnsc_env * dnsc_create(void);
 
-int
-dnsc_apply_cfg(struct dnsc_env *env, struct config_file *cfg);
-
-const KeyPair *
-dnsc_find_keypair(struct dnsc_env* dnscenv, struct sldns_buffer* buffer);
+/**
+ * Apply configuration.
+ * Read certificates and secret keys from configuration. Initialize hashkey and
+ * provider name as well as loading cert TXT records.
+ * In case of issue applying configuration, this function fatals.
+ * \param[in] env the struct dnsc_env to populate.
+ * \param[in] cfg the config_file struct with dnscrypt options.
+ * \return 0 on success.
+ */
+int dnsc_apply_cfg(struct dnsc_env *env, struct config_file *cfg);
 
 /**
  * handle a crypted dnscrypt request.
@@ -71,28 +80,14 @@ dnsc_find_keypair(struct dnsc_env* dnscenv, struct sldns_buffer* buffer);
  * return 0 in case of failure.
  */
 int dnsc_handle_curved_request(struct dnsc_env* dnscenv,
-                        struct comm_reply* repinfo);
+                               struct comm_reply* repinfo);
 /**
  * handle an unencrypted dnscrypt request.
  * Determine wether or not a query is going over the dnscrypt channel and
  * attempt to curve it unless it was not crypted like when  it is a
  * certificate query.
- * return 0 in case of failure.
+ * \return 0 in case of failure.
  */
 
 int dnsc_handle_uncurved_request(struct comm_reply *repinfo);
-
-int
-dnscrypt_server_uncurve(const KeyPair *keypair,
-                        uint8_t client_nonce[crypto_box_HALF_NONCEBYTES],
-                        uint8_t nmkey[crypto_box_BEFORENMBYTES],
-						            struct sldns_buffer* buffer);
-
-int
-dnscrypt_server_curve(const KeyPair *keypair,
-                      uint8_t client_nonce[crypto_box_HALF_NONCEBYTES],
-                      uint8_t nmkey[crypto_box_BEFORENMBYTES],
-                      struct sldns_buffer* buffer,
-                      uint8_t udp,
-                      size_t max_udp_size);
 #endif

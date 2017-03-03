@@ -136,13 +136,16 @@ extern struct config_parser_state* cfg_parser;
 %token VAR_VIEW_FIRST VAR_SERVE_EXPIRED VAR_FAKE_DSA
 %token VAR_LOG_IDENTITY
 %token VAR_USE_SYSTEMD VAR_SHM_ENABLE VAR_SHM_KEY
+%token VAR_DNSCRYPT VAR_DNSCRYPT_ENABLE VAR_DNSCRYPT_PORT VAR_DNSCRYPT_PROVIDER
+%token VAR_DNSCRYPT_SECRET_KEY VAR_DNSCRYPT_PROVIDER_CERT
 
 %%
 toplevelvars: /* empty */ | toplevelvars toplevelvar ;
 toplevelvar: serverstart contents_server | stubstart contents_stub |
 	forwardstart contents_forward | pythonstart contents_py | 
 	rcstart contents_rc | dtstart contents_dt | viewstart 
-	contents_view
+	contents_view |
+	dnscstart contents_dnsc
 	;
 
 /* server: declaration */
@@ -2029,6 +2032,58 @@ server_log_identity: VAR_LOG_IDENTITY STRING_ARG
 		OUTYY(("P(server_log_identity:%s)\n", $2));
 		free(cfg_parser->cfg->log_identity);
 		cfg_parser->cfg->log_identity = $2;
+	}
+	;
+dnscstart: VAR_DNSCRYPT
+	{
+		OUTYY(("\nP(dnscrypt:)\n"));
+		OUTYY(("\nP(dnscrypt:)\n"));
+	}
+	;
+contents_dnsc: contents_dnsc content_dnsc
+	| ;
+content_dnsc:
+	dnsc_dnscrypt_enable | dnsc_dnscrypt_port | dnsc_dnscrypt_provider |
+	dnsc_dnscrypt_secret_key | dnsc_dnscrypt_provider_cert
+	;
+dnsc_dnscrypt_enable: VAR_DNSCRYPT_ENABLE STRING_ARG
+	{
+		OUTYY(("P(dnsc_dnscrypt_enable:%s)\n", $2));
+		if(strcmp($2, "yes") != 0 && strcmp($2, "no") != 0)
+			yyerror("expected yes or no.");
+		else cfg_parser->cfg->dnscrypt = (strcmp($2, "yes")==0);
+	}
+	;
+
+dnsc_dnscrypt_port: VAR_DNSCRYPT_PORT STRING_ARG
+	{
+		OUTYY(("P(dnsc_dnscrypt_port:%s)\n", $2));
+
+		if(atoi($2) == 0)
+			yyerror("port number expected");
+		else cfg_parser->cfg->dnscrypt_port = atoi($2);
+		free($2);
+	}
+	;
+dnsc_dnscrypt_provider: VAR_DNSCRYPT_PROVIDER STRING_ARG
+	{
+		OUTYY(("P(dnsc_dnscrypt_provider:%s)\n", $2));
+		free(cfg_parser->cfg->dnscrypt_provider);
+		cfg_parser->cfg->dnscrypt_provider = $2;
+	}
+	;
+dnsc_dnscrypt_provider_cert: VAR_DNSCRYPT_PROVIDER_CERT STRING_ARG
+	{
+		OUTYY(("P(dnsc_dnscrypt_provider_cert:%s)\n", $2));
+		if(!cfg_strlist_insert(&cfg_parser->cfg->dnscrypt_provider_cert, $2))
+			fatal_exit("out of memory adding dnscrypt-provider-cert");
+	}
+	;
+dnsc_dnscrypt_secret_key: VAR_DNSCRYPT_SECRET_KEY STRING_ARG
+	{
+		OUTYY(("P(dnsc_dnscrypt_secret_key:%s)\n", $2));
+		if(!cfg_strlist_insert(&cfg_parser->cfg->dnscrypt_secret_key, $2))
+			fatal_exit("out of memory adding dnscrypt-secret-key");
 	}
 	;
 %%

@@ -63,6 +63,11 @@ struct shm_main_info;
 struct dt_env;
 #endif
 
+#include "dnscrypt/dnscrypt_config.h"
+#ifdef USE_DNSCRYPT
+struct dnsc_env;
+#endif
+
 /**
  * Structure holding worker list.
  * Holds globally visible information.
@@ -120,6 +125,11 @@ struct daemon {
 	struct dt_env* dtenv;
 #endif
 	struct shm_main_info* shm_info;
+#ifdef USE_DNSCRYPT
+	/** the dnscrypt environment */
+	struct dnsc_env* dnscenv;
+#endif
+
 };
 
 /**

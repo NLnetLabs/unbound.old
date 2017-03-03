@@ -725,7 +725,8 @@ setup_tcp_handler(struct comm_point* c, int fd, int cur, int max)
 	log_assert(c->fd == -1);
 	sldns_buffer_clear(c->buffer);
 #ifdef USE_DNSCRYPT
-    sldns_buffer_clear(c->dnscrypt_buffer);
+    if (c->dnscrypt)
+        sldns_buffer_clear(c->dnscrypt_buffer);
 #endif
 	c->tcp_is_reading = 1;
 	c->tcp_byte_count = 0;
@@ -1378,15 +1379,15 @@ comm_point_tcp_handle_write(int fd, struct comm_point* c)
 	if(c->tcp_do_fastopen == 1) {
 		/* this form of sendmsg() does both a connect() and send() so need to
 		   look for various flavours of error*/
-		uint16_t len = htons(sldns_buffer_limit(c->buffer));
+		uint16_t len = htons(sldns_buffer_limit(buffer));
 		struct msghdr msg;
 		struct iovec iov[2];
 		c->tcp_do_fastopen = 0;
 		memset(&msg, 0, sizeof(msg));
 		iov[0].iov_base = (uint8_t*)&len + c->tcp_byte_count;
 		iov[0].iov_len = sizeof(uint16_t) - c->tcp_byte_count;
-		iov[1].iov_base = sldns_buffer_begin(c->buffer);
-		iov[1].iov_len = sldns_buffer_limit(c->buffer);
+		iov[1].iov_base = sldns_buffer_begin(buffer);
+		iov[1].iov_len = sldns_buffer_limit(buffer);
 		log_assert(iov[0].iov_len > 0);
 		log_assert(iov[1].iov_len > 0);
 		msg.msg_name = &c->repinfo.addr;
@@ -1414,9 +1415,9 @@ comm_point_tcp_handle_write(int fd, struct comm_point* c)
 			c->tcp_byte_count += r;
 			if(c->tcp_byte_count < sizeof(uint16_t))
 				return 1;
-			sldns_buffer_set_position(c->buffer, c->tcp_byte_count - 
+			sldns_buffer_set_position(buffer, c->tcp_byte_count - 
 				sizeof(uint16_t));
-			if(sldns_buffer_remaining(c->buffer) == 0) {
+			if(sldns_buffer_remaining(buffer) == 0) {
 				tcp_callback_writer(c);
 				return 1;
 			}
@@ -1688,7 +1689,7 @@ comm_point_create_udp_ancil(struct comm_base *base, int fd,
 	c->tcp_do_close = 0;
 	c->do_not_close = 0;
 #ifdef USE_DNSCRYPT
-	c->dnscrypt = 0;
+    c->dnscrypt = 0;
     c->dnscrypt_buffer = buffer;
 #endif
 	c->inuse = 0;
@@ -2234,9 +2235,9 @@ size_t comm_point_get_mem(struct comm_point* c)
 	if(c->type == comm_tcp || c->type == comm_local) {
 		s += sizeof(*c->buffer) + sldns_buffer_capacity(c->buffer);
 #ifdef USE_DNSCRYPT
+        s += sizeof(*c->dnscrypt_buffer);
         if(c->buffer != c->dnscrypt_buffer) {
-            s += sizeof(*c->dnscrypt_buffer) + \
-                 sldns_buffer_capacity(c->dnscrypt_buffer);
+            s += sldns_buffer_capacity(c->dnscrypt_buffer);
         }
 #endif
     }

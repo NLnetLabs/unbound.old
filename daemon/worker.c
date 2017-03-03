@@ -73,6 +73,7 @@
 #include "libunbound/libworker.h"
 #include "sldns/sbuffer.h"
 #include "util/shm_side/shm_main.h"
+#include "dnscrypt/dnscrypt.h"
 
 #ifdef HAVE_SYS_TYPES_H
 #  include <sys/types.h>

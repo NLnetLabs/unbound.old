@@ -1522,6 +1522,13 @@ comm_point_tcp_handle_callback(int fd, short event, void* arg)
 	if(c->tcp_parent) {
 		c->dnscrypt = c->tcp_parent->dnscrypt;
 	}
+    if(c->dnscrypt && c->dnscrypt_buffer == c->buffer) {
+        c->dnscrypt_buffer = sldns_buffer_new(sldns_buffer_capacity(c->buffer));
+        if(!c->dnscrypt_buffer) {
+            log_err("Could not allocate dnscrypt buffer");
+            return;
+        }
+    }
 #endif
 
 	if(event&UB_EV_READ) {
@@ -1756,15 +1763,10 @@ comm_point_create_tcp_handler(struct comm_base *base,
 	c->tcp_do_fastopen = 0;
 #endif
 #ifdef USE_DNSCRYPT
-	c->dnscrypt = parent->dnscrypt;
-    c->dnscrypt_buffer = sldns_buffer_new(bufsize);
-    if(!c->dnscrypt_buffer) {
-        sldns_buffer_free(c->buffer);
-        free(c->timeout);
-        free(c->ev);
-        free(c);
-        return NULL;
-    }
+    c->dnscrypt = 0;
+    // We don't know just yet if this is a dnscrypt channel. Allocation
+    // will be done when handling the callback.
+    c->dnscrypt_buffer = c->buffer;
 #endif
 	c->repinfo.c = c;
 	c->callback = callback;
